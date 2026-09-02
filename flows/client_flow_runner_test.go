@@ -14,6 +14,7 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"google.golang.org/protobuf/proto"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	"www.velocidex.com/golang/velociraptor/api"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
@@ -47,7 +48,7 @@ import (
 var (
 	mock_definitions = []string{`
 name: Windows.Remediation.QuarantineMonitor
-type: SERVER_EVENT
+type: CLIENT_EVENT
 `, `
 name: System.Hunt.Creation
 type: SERVER_EVENT
@@ -83,9 +84,10 @@ type: INTERNAL
 
 type ServerTestSuite struct {
 	test_utils.TestSuite
-	server        *server.Server
-	client_crypto *crypto_client.ClientCryptoManager
-	client_id     string
+	server                *server.Server
+	client_crypto         *crypto_client.ClientCryptoManager
+	client_id             string
+	investigator_username string
 }
 
 type MockAPIClientFactory struct {
@@ -96,6 +98,47 @@ func (self MockAPIClientFactory) GetAPIClient(
 	ctx context.Context,
 	config_obj *config_proto.Config) (api_proto.APIClient, func() error, error) {
 	return self.mock, func() error { return nil }, nil
+}
+
+type blockingDataStore struct {
+	datastore.DataStore
+
+	blocked_path   string
+	write_started  chan struct{}
+	write_done     chan struct{}
+	continue_write chan struct{}
+	block_once     sync.Once
+}
+
+func (self *blockingDataStore) SetSubjectWithCompletion(
+	config_obj *config_proto.Config,
+	urn file_store_api.DSPathSpec,
+	message proto.Message,
+	completion func()) error {
+
+	if urn.AsClientPath() != self.blocked_path {
+		return self.DataStore.SetSubjectWithCompletion(
+			config_obj, urn, message, completion)
+	}
+
+	block_write := false
+	self.block_once.Do(func() {
+		block_write = true
+		close(self.write_started)
+	})
+	if !block_write {
+		return self.DataStore.SetSubjectWithCompletion(
+			config_obj, urn, message, completion)
+	}
+
+	go func() {
+		defer close(self.write_done)
+
+		<-self.continue_write
+		_ = self.DataStore.SetSubjectWithCompletion(
+			config_obj, urn, message, completion)
+	}()
+	return nil
 }
 
 func (self *ServerTestSuite) SetupTest() {
@@ -130,6 +173,18 @@ func (self *ServerTestSuite) SetupTest() {
 	err = client_info_manager.Set(self.Ctx, &services.ClientInfo{
 		ClientInfo: &actions_proto.ClientInfo{ClientId: self.client_id},
 	})
+	assert.NoError(self.T(), err)
+
+	user_manager := services.GetUserManager()
+	self.investigator_username = "UserInvestigator"
+	err = user_manager.SetUser(self.Sm.Ctx,
+		&api_proto.VelociraptorUser{
+			Name: self.investigator_username,
+		})
+	assert.NoError(self.T(), err)
+
+	err = services.GrantRoles(self.ConfigObj, self.investigator_username,
+		[]string{"investigator"})
 	assert.NoError(self.T(), err)
 }
 
@@ -300,11 +355,14 @@ func (self *ServerTestSuite) TestFlowStates() {
 	}
 
 	// The client record should not have any in flight flows now.
-	vtesting.WaitUntil(15*time.Second, self.T(), func() bool {
-		client_info, err = client_info_manager.Get(self.Ctx, self.client_id)
+	vtesting.WaitUntilWithError(15*time.Second, self.T(), func() bool {
+		client_info, err := client_info_manager.Get(self.Ctx, self.client_id)
 		assert.NoError(self.T(), err)
 
 		return len(client_info.InFlightFlows) == 0
+	}, func() string {
+		client_info, _ := client_info_manager.Get(self.Ctx, self.client_id)
+		return json.MustMarshalString(client_info)
 	})
 
 	// Lets get the next batch of flows off the queue. This is now
@@ -323,7 +381,7 @@ func (self *ServerTestSuite) TestFlowStates() {
 	closer = utils.MockTime(clock)
 	defer closer()
 
-	vtesting.WaitUntil(15*time.Second, self.T(), func() bool {
+	vtesting.WaitUntilWithError(15*time.Second, self.T(), func() bool {
 		// Get the next set of tasks for the client.
 		tasks, err = client_info_manager.GetClientTasks(self.Ctx, self.client_id)
 		assert.NoError(self.T(), err)
@@ -332,6 +390,9 @@ func (self *ServerTestSuite) TestFlowStates() {
 		clock.Set(time.Unix(time_origin, 0))
 
 		return len(tasks) == 1
+	}, func() string {
+		client_info, _ := client_info_manager.Get(self.Ctx, self.client_id)
+		return json.MustMarshalString(client_info)
 	})
 
 	// The server will send the client a flow stats request - please
@@ -397,7 +458,7 @@ func (self *ServerTestSuite) TestClientEventTable() {
 	assert.NoError(self.T(), err)
 
 	err = client_event_manager.SetClientMonitoringState(self.Ctx,
-		self.ConfigObj, "",
+		self.ConfigObj, self.investigator_username,
 		&flows_proto.ClientEventTable{
 			Artifacts: &flows_proto.ArtifactCollectorArgs{
 				Artifacts: []string{"Generic.Client.Stats"},
@@ -1240,6 +1301,136 @@ func (self *ServerTestSuite) TestUnknownFlow() {
 		"Unknown flow")
 
 	assert.Equal(self.T(), len(collection_context.Context.QueryStats), 1)
+}
+
+func (self *ServerTestSuite) TestFlowCompletionWaitsForFinalStatsWrite() {
+	t := self.T()
+
+	flow_id, err := self.createArtifactCollection()
+	require.NoError(t, err)
+
+	// Drain task so flow becomes in flight
+	client_info_manager, err := services.GetClientInfoManager(
+		self.ConfigObj)
+	require.NoError(t, err)
+
+	tasks, err := client_info_manager.GetClientTasks(
+		self.Ctx, self.client_id)
+	require.NoError(t, err)
+	require.NotEmpty(t, tasks)
+
+	vtesting.WaitUntil(time.Second, t, func() bool {
+		client_record, err := client_info_manager.Get(
+			self.Ctx, self.client_id)
+		assert.NoError(t, err)
+		if err != nil {
+			return false
+		}
+
+		_, pres := client_record.InFlightFlows[flow_id]
+		return pres
+	})
+
+	// Watch for completion event associated with the flow
+	completions := ordereddict.NewDict()
+	err = journal.WatchQueueWithCB(self.Ctx, self.ConfigObj, self.Wg,
+		artifacts.FLOW_COMPLETION, "",
+		func(ctx context.Context, config_obj *config_proto.Config,
+			row *ordereddict.Dict) error {
+			completed_flow_id, _ := row.GetString("FlowId")
+			if completed_flow_id == flow_id {
+				key := fmt.Sprintf("%d", completions.Len())
+				completions.Set(key, row)
+			}
+			return nil
+		})
+	require.NoError(t, err)
+
+	// Delay final stats write
+	old_db, err := datastore.GetDB(self.ConfigObj)
+	require.NoError(t, err)
+
+	blocked_db := &blockingDataStore{
+		DataStore: old_db,
+		blocked_path: paths.NewFlowPathManager(
+			self.client_id, flow_id).Stats().AsClientPath(),
+		write_started:  make(chan struct{}),
+		write_done:     make(chan struct{}),
+		continue_write: make(chan struct{}),
+	}
+
+	datastore.OverrideDatastoreImplementation(blocked_db)
+	defer datastore.OverrideDatastoreImplementation(old_db)
+
+	var release_once sync.Once
+	release := func() {
+		release_once.Do(func() {
+			close(blocked_db.continue_write)
+		})
+	}
+
+	// Release and drain blocked write before suite teardown
+	defer func() {
+		release()
+
+		select {
+		case <-blocked_db.write_started:
+			select {
+			case <-blocked_db.write_done:
+			case <-time.After(5 * time.Second):
+			}
+		default:
+		}
+	}()
+
+	runner := flows.NewFlowRunner(self.Ctx, self.ConfigObj)
+	require.NoError(t, runner.ProcessSingleMessage(
+		self.Ctx,
+		&crypto_proto.VeloMessage{
+			Source:    self.client_id,
+			SessionId: flow_id,
+			RequestId: constants.ProcessVQLResponses,
+			FlowStats: &crypto_proto.FlowStats{
+				QueryStatus: []*crypto_proto.VeloStatus{
+					{
+						Status: crypto_proto.VeloStatus_OK,
+						NamesWithResponse: []string{
+							"BasicInformation",
+						},
+					},
+				},
+				FlowComplete: true,
+			},
+		}))
+	runner.Close(self.Ctx)
+
+	select {
+	case <-blocked_db.write_started:
+	default:
+		t.Fatal("final stats write never reached the datastore")
+	}
+
+	// Completion should be blocked until stats write is complete
+	time.Sleep(time.Second / 2)
+	require.Equal(t, 0, completions.Len())
+
+	release()
+	vtesting.WaitUntil(5*time.Second, t, func() bool {
+		return completions.Len() == 1
+	})
+	require.Equal(t, 1, completions.Len())
+
+	// Downstream consumers should be able to read the final stats
+	stored_stats := &flows_proto.ArtifactCollectorContext{}
+	err = old_db.GetSubject(
+		self.ConfigObj,
+		paths.NewFlowPathManager(self.client_id, flow_id).Stats(),
+		stored_stats)
+	require.NoError(t, err)
+	require.Len(t, stored_stats.QueryStats, 1)
+	require.Equal(t,
+		[]string{"BasicInformation"},
+		stored_stats.QueryStats[0].NamesWithResponse)
 }
 
 // Test an unknown flow. What happens when the server receives a

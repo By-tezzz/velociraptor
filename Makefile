@@ -7,10 +7,10 @@ assets:
 auto:
 	go run make.go -v auto
 
-test:
+test: vale
 	go test -race -v --tags server_vql ./...
 
-test_less:
+test_less: vale
 	go test -race -v --tags server_vql ./... 2>&1 | less
 
 golden:
@@ -130,6 +130,7 @@ deadcode:
 api_check:
 	python ./scripts/api_checker.py .
 
+# Build the docker container
 container:
 	go run make.go -v container
 

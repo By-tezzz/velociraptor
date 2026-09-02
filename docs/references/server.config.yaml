@@ -2,7 +2,10 @@
 # for all options currently available.
 
 # The values you see are the default values that will be used when the
-# option is omitted.
+# option is omitted. If an item is a list, the default list applies
+# only when the item is empty. If you want to preserve some of the
+# default items in the list, you should copy the entire default list
+# and set it.
 
 ## This is the version of the Velociraptor binary used to generate
 ## this configuration file. It simply annotates the produced file and
@@ -724,7 +727,15 @@ Frontend:
   # A proxy setting to use - Velociraptor needs to connect to download
   # tools. This setting will force it to go out over this proxy. NOTE-
   # If you don't want to allow outbound connections, just set this to
-  # an non existent setting (e.g. http://127.0.0.1:3128).
+  # an non-existent setting (e.g. http://127.0.0.1:3128).
+  #
+  # SECURITY: This proxy setting and the proxy_config below control
+  # ALL server-initiated outbound HTTP connections, including tool
+  # materialization and VQL's http_client() plugin. Without a proxy or
+  # with a permissive proxy, any user with admin-equivalent
+  # permissions can make the server fetch arbitrary URLs, including
+  # internal RFC 1918 addresses and cloud endpoints. Set a restrictive
+  # proxy or configure proxy_url_regexp to limit outbound destinations
   proxy: "http://127.0.0.1:3128"
 
   # These proxy settings are exactly the same as the
@@ -1040,7 +1051,7 @@ Datastore:
   # The maximum size of stored objects in the datastore. The Datastore
   # is assumed to contain smallish objects which are read and written
   # atomically. This setting places a limit on the size of these
-  # objects to mainain efficiency and speed. If you hit this limit it
+  # objects to maintain efficiency and speed. If you hit this limit it
   # means that you need to rethink your approach. See
   # https:docs.velociraptor.app/knowledge_base/tips/grpc_errors/ The
   # default size is 4Mb.
@@ -1296,6 +1307,11 @@ server_type: linux
 ## client. NOTE: This is currently not very robust - i.e. it does not
 ## hide the artifact names very well - you should not name artifacts
 ## in a sensitive way.
+##
+## This value is server-only and is NOT distributed to client
+## configuration files. Do not confuse it with Client.nonce,
+## which is a different value that IS sent to clients for org
+## grouping.
 obfuscation_nonce: zKJDb3KcWh8=
 
 # Path to store autocert certificates.
@@ -1516,16 +1532,22 @@ security:
   # this is empty the file accessor will work on all
   # directories. If you want to disable access to the server's
   # filesystem you can set this to a non existent directory,
-  # e.g. /nonexistent/ .
+  # e.g. /nonexistent/ . The below shows the default list, which is used
+  # if nothing is set here. You should copy and modify the entire list
+  # to preserve the defaults.
   allowed_file_accessor_prefix:
     - /tmp/
 
-  # Deny takes precedent over allow.
+  # Deny takes precedent over allow. The below shows the default list,
+  # which is used if nothing is set here. You should copy and modify
+  # the entire list to preserve the defaults.
   denied_file_accessor_prefix:
     - /bin/
 
-  # A list of prefixes allowed for the fs accessor. All other
-  # prefixes will be rejected.
+  # A list of prefixes allowed for the fs accessor. All other prefixes
+  # will be rejected. The below shows the default list, which is used
+  # if nothing is set here. You should copy and modify the entire list
+  # to preserve the defaults.
   allowed_fs_accessor_prefix:
    - artifact_definitions
    - clients
@@ -1536,15 +1558,19 @@ security:
    - server_artifacts
    - server_artifacts_logs
 
-  # Deny takes precedent over allow.
+  # Deny takes precedent over allow. IMPORTANT: Setting this list replaces
+  # the built-in deny list (acl, backups, config, orgs, secrets, users)
+  # rather than merging with it. If you add custom prefixes here, you must
+  # also include any of the built-in prefixes you want to keep.
   denied_fs_accessor_prefix:
    - config
-
 
   # If these are set we enforce VQL to only have the specified allowed
   # VQL plugins and functions. This is a way to harden the server by
   # removing potentially sensitive functionality to allow only
-  # approved VQL plugins to run.
+  # approved VQL plugins to run. The below shows some examples but the
+  # default is actually an empty list which causes no plugins to be
+  # restricted.
   allowed_plugins:
     - glob
   allowed_functions:
@@ -1553,7 +1579,9 @@ security:
     - auto
 
   # Alternatively, it might be easier to deny specific plugins and
-  # functions and accessors.
+  # functions and accessors. The below shows some examples but the
+  # default is actually an empty list which causes no plugins to be
+  # denied.
   denied_plugins:
     - execve
 
@@ -1563,8 +1591,10 @@ security:
   denied_accessors:
     - s3
 
-  # When the server is in lockdown mode the following permissions
-  # will be denied (Even for administrators).
+  # When the server is in lockdown mode the following permissions will
+  # be denied (Even for administrators). The below shows the default
+  # list, which is used if nothing is set here. You should copy and
+  # modify the entire list to preserve the defaults.
   lockdown_denied_permissions:
    - ARTIFACT_WRITER
    - SERVER_ARTIFACT_WRITER

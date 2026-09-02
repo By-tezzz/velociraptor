@@ -41,6 +41,7 @@ import (
 	ntfs "www.velocidex.com/golang/go-ntfs/parser"
 	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/utils/files"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -87,6 +88,12 @@ type AccessorReader struct {
 
 	key      string
 	max_size int64
+
+	// Atomic reference count for in flight readers
+	ref int
+
+	// Delay close until all concurrent readers are done.
+	waiting_to_close bool
 
 	reader       accessors.ReadSeekCloser
 	paged_reader *ntfs.PagedReader
@@ -168,9 +175,33 @@ func (self *AccessorReader) Flush() {
 	self.Close()
 }
 
+func (self *AccessorReader) decRef() {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self.ref--
+	if self.ref == 0 && self.waiting_to_close {
+		self._Close()
+	}
+}
+
 // Close all references to the underlying reader.
 func (self *AccessorReader) Close() error {
 	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	// Delay the close until all the readers are done.
+	if self.ref > 0 {
+		self.waiting_to_close = true
+		return nil
+	}
+
+	return self._Close()
+}
+
+func (self *AccessorReader) _Close() error {
+	self.ref = 0
+	self.waiting_to_close = false
 
 	cancel := self.cancel
 	self.cancel = nil
@@ -180,14 +211,14 @@ func (self *AccessorReader) Close() error {
 	self.paged_reader = nil
 	self.last_opened = time.Time{}
 
-	self.mu.Unlock()
-
 	// Cancel any future alarms
 	if cancel != nil {
 		cancel()
 	}
 
 	if reader != nil {
+		// Track opens and closes
+		files.Remove(self.File.String())
 		reader.Close()
 	}
 
@@ -222,9 +253,21 @@ func (self *AccessorReader) ReadAt(buf []byte, offset int64) (int, error) {
 		paged_reader, err := ntfs.NewPagedReader(
 			utils.MakeReaderAtter(reader), 1024*8, lru_size)
 		if err != nil {
+			reader.Close()
 			self.mu.Unlock()
 			return 0, err
 		}
+
+		// Try to read this buffer from the new reader
+		result, err := paged_reader.ReadAt(buf, offset)
+		if err != nil {
+			reader.Close()
+			self.mu.Unlock()
+			return 0, err
+		}
+
+		// Track opens and closed
+		files.Add(self.File.String())
 
 		// Set an alarm to close the file in the future - this
 		// ensures we don't hold open handles for long running
@@ -252,7 +295,6 @@ func (self *AccessorReader) ReadAt(buf []byte, offset int64) (int, error) {
 			}
 		}()
 
-		result, err := paged_reader.ReadAt(buf, offset)
 		self.paged_reader = paged_reader
 		self.reader = reader
 		self.last_opened = utils.GetTime().Now()
@@ -268,6 +310,11 @@ func (self *AccessorReader) ReadAt(buf []byte, offset int64) (int, error) {
 	}
 
 	paged_reader := self.paged_reader
+
+	// Manager the reference count across the read to prevent the file
+	// from closing during the read.
+	self.ref++
+	defer self.decRef()
 
 	// Reading from the paged reader may trigger another reader due to
 	// LRU so we release the lock before we do it.
@@ -288,6 +335,7 @@ func GetReaderPool(scope vfilter.Scope, lru_size int64) *ReaderPool {
 		pool := &ReaderPool{
 			lru: ttlcache.NewCache(),
 		}
+		pool.lru.SetTTL(time.Hour)
 		pool.lru.SetCacheSizeLimit(int(lru_size))
 
 		// Close the item on expiration

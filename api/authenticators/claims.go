@@ -51,7 +51,7 @@ type ClaimsGetter interface {
 // claims from:
 //  1. The standard OIDC UserInfo endpoint
 //  2. Attempts to decode the claim from the AccessToken if it is a JWT.
-//     This behaviour was observed on ADFS.
+//     This behavior was observed on ADFS.
 type OidcClaimsGetter struct {
 	config_obj    *config_proto.Config
 	authenticator *config_proto.Authenticator
@@ -254,12 +254,55 @@ func (self *OidcClaimsGetter) newClaimsFromDict(
 			username_field, claims)
 	}
 
+	err := self.validateClaimsDict(ctx, config_obj, claims, email)
+	if err != nil {
+		return nil, err
+	}
+
 	res := &Claims{
 		Username: email,
 	}
 
 	return res, self.SetRolesForUser(
 		ctx, config_obj, email, claims)
+}
+
+// Validate the claims further.
+// https://learn.microsoft.com/en-us/entra/identity-platform/claims-validation
+func (self *OidcClaimsGetter) validateClaimsDict(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	claims *ordereddict.Dict,
+	username string) error {
+
+	// Check the tenant id for ADFS
+	if self.authenticator.Tenant != "" {
+		tid, pres := claims.GetString("tid")
+		if pres && tid != self.authenticator.Tenant {
+			return fmt.Errorf("incorrect tenant in claims: %s - need %s",
+				tid, self.authenticator.Tenant)
+		}
+	}
+
+	// Try to get an oid for the user
+	oid, _ := claims.GetString("oid")
+	if oid == "" {
+		sub, _ := claims.GetString("sub")
+		if sub != "" {
+			iss, pres := claims.Get("iss")
+			if pres {
+				sub = fmt.Sprintf("%s:%s", sub, iss)
+			}
+			oid = sub
+		}
+	}
+
+	// Verify the oid against the user record.
+	if oid != "" && !self.authenticator.DisableEmailToSubPin {
+		return checkUserOID(ctx, oid, username)
+	}
+
+	return nil
 }
 
 func (self *OidcClaimsGetter) shouldUpdateACLs(

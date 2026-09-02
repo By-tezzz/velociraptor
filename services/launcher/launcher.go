@@ -102,7 +102,7 @@
 
   ## Summary
 
-  The following rules summarise if the artifact is collected in
+  The following rules summarize if the artifact is collected in
   parallel mode (i.e. sources in separate requests) or Serial Mode
   (i.e. all sources in the same request).
 
@@ -234,8 +234,7 @@ func (self *Launcher) CompileCollectorArgs(
 		}
 
 		// Make sure the user can collect this artifact.
-		err := CheckAccess(
-			config_obj, artifact, collector_request, acl_manager)
+		err := CheckAccess(artifact, collector_request.ClientId, acl_manager)
 		if err != nil {
 			return nil, err
 		}
@@ -336,8 +335,8 @@ func (self *Launcher) CompileCollectorArgs(
 				vql_collector_args.IopsLimit = collector_request.IopsLimit
 			}
 
-			if vql_collector_args.Timeout == 0 &&
-				collector_request.Timeout > 0 {
+			// If there is a timeout set on the collection, use that, otherwise default to the artifact timeout.
+			if collector_request.Timeout > 0 {
 				vql_collector_args.Timeout = collector_request.Timeout
 			}
 
@@ -556,6 +555,11 @@ func AddToolDependency(
 	vql_collector_args.Env = append(vql_collector_args.Env, &actions_proto.VQLEnv{
 		Key:   fmt.Sprintf("Tool_%v_FILENAME", tool_info.Name),
 		Value: tool_info.Filename,
+	})
+
+	vql_collector_args.Env = append(vql_collector_args.Env, &actions_proto.VQLEnv{
+		Key:   fmt.Sprintf("Tool_%v_VERSION", tool_info.Name),
+		Value: tool_info.Version,
 	})
 
 	// Support local filesystem access for local tools.

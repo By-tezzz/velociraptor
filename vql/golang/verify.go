@@ -41,22 +41,37 @@ func (self VerifyFunction) Call(ctx context.Context,
 
 	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
-		return err
+		scope.Log("verify: %v", err)
+		return vfilter.Null{}
 	}
 
 	repository, err := manager.GetGlobalRepository(config_obj)
 	if err != nil {
-		return err
+		scope.Log("verify: %v", err)
+		return vfilter.Null{}
 	}
 
 	state := launcher.NewAnalysisState(arg.Artifact)
 
 	if arg.Repository != "" {
-		cached_any := vql_subsystem.CacheGet(scope, vql_server.REPOSITORY_CACHE_TAG+arg.Repository)
+		cached_any := vql_subsystem.CacheGet(
+			scope, vql_server.REPOSITORY_CACHE_TAG+arg.Repository)
 
-		if cached_repository, ok := cached_any.(services.Repository); ok {
+		cached_repository, ok := cached_any.(services.Repository)
+		if ok {
 			repository = cached_repository
+		} else {
+			// Make a local copy.
+			repository = repository.Copy()
+
+			// Cache for next time.
+			vql_subsystem.CacheSet(scope,
+				vql_server.REPOSITORY_CACHE_TAG+arg.Repository, repository)
 		}
+
+	} else {
+		// Operate on a copy of the global repository
+		repository = repository.Copy()
 	}
 
 	artifact, pres := repository.Get(ctx, config_obj, arg.Artifact)
@@ -69,7 +84,7 @@ func (self VerifyFunction) Call(ctx context.Context,
 			})
 		if err != nil {
 			state.SetError(launcher.YAML_ERROR, launcher.YAML_ERROR_MSG, err)
-			return state
+			return stateToDict(state)
 		}
 	}
 
@@ -77,7 +92,36 @@ func (self VerifyFunction) Call(ctx context.Context,
 	launcher.VerifyArtifact(
 		ctx, config_obj, repository, artifact, state)
 
-	return state
+	return stateToDict(state)
+}
+
+func stateToDict(state *launcher.AnalysisState) *ordereddict.Dict {
+	var errors []string
+	for _, e := range state.Errors {
+		errors = append(errors, e.Error())
+	}
+
+	definitions := make(map[string]*ordereddict.Dict)
+	for key, d := range state.Definitions {
+		var args []string
+		for _, arg := range d.Args {
+			args = append(args, arg.Name)
+		}
+
+		definitions[key] = ordereddict.NewDict().
+			Set("Type", d.Type).
+			Set("Name", d.Name).
+			Set("Args", args).
+			Set("Defaults", d.Defaults)
+	}
+
+	return ordereddict.NewDict().
+		Set("Artifact", state.Artifact).
+		Set("Permissions", state.Permissions).
+		Set("Errors", errors).
+		Set("Warnings", state.Warnings).
+		Set("Definitions", definitions).
+		Set("Suppressions", state.Suppressions)
 }
 
 func (self VerifyFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
